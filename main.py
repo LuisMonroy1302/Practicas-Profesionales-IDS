@@ -24,7 +24,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# La conexión se toma de la variable de entorno (nunca contraseñas en el código)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Falta la variable de entorno DATABASE_URL")
@@ -34,7 +33,6 @@ ALGORITHM = "HS256"
 
 
 def get_conn():
-    # Neon exige SSL; la base local funciona sin parámetros adicionales
     if "neon.tech" in DATABASE_URL:
         return psycopg2.connect(DATABASE_URL, sslmode="require")
     return psycopg2.connect(DATABASE_URL)
@@ -61,6 +59,23 @@ def requerir_admin(payload: dict = Depends(obtener_payload)):
     if payload.get("rol") != "Administrador":
         raise HTTPException(403, "Privilegios de Administrador requeridos")
     return payload
+
+
+def requerir_login(payload: dict = Depends(obtener_payload)):
+    return payload
+
+
+def zona_permitida(conn, zona_id: int, payload: dict) -> bool:
+    if payload.get("rol") == "Administrador":
+        return True
+    sup_id = payload.get("supervisor_id")
+    if sup_id is None:
+        return False
+    cur = conn.cursor()
+    cur.execute("SELECT supervisor_id FROM zonas WHERE zona_id = %s", (zona_id,))
+    fila = cur.fetchone()
+    cur.close()
+    return fila is not None and fila[0] == sup_id
 
 
 # ---------------- Modelos de datos (Pydantic) ----------------
@@ -108,6 +123,14 @@ class ClienteIn(BaseModel):
     zona_id: int
 
 
+class ClienteUpdate(BaseModel):
+    numero_cliente: Optional[str] = None
+    nombre_completo: Optional[str] = None
+    referencia_domicilio: Optional[str] = None
+    latitud: Optional[float] = None
+    longitud: Optional[float] = None
+
+
 class UsuarioIn(BaseModel):
     numero_empleado: str
     password: str
@@ -143,7 +166,6 @@ def login(datos: LoginIn):
         raise HTTPException(401, "Número de empleado o contraseña incorrectos")
     nombre, rol = fila
 
-    # Vínculo con el registro de supervisor (si el número de empleado coincide)
     supervisor_id = None
     grupo_id = None
     if datos.numero_empleado.isdigit():
@@ -358,22 +380,44 @@ def eliminar_zona(zona_id: int, _: dict = Depends(requerir_admin)):
     return {"mensaje": "Zona eliminada correctamente"}
 
 
-# ---------------- Clientes (sin restricción de admin: operará por zona) ----------------
+# ---------------- Clientes con permiso por zona ----------------
 @app.get("/clientes")
-def listar_clientes():
+def listar_clientes(zona_id: int = None, payload: dict = Depends(requerir_login)):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        "SELECT cliente_id, numero_cliente, nombre_completo, latitud, longitud, zona_id "
-        "FROM clientes ORDER BY cliente_id"
-    )
+    if zona_id is not None:
+        if not zona_permitida(conn, zona_id, payload):
+            cur.close(); conn.close()
+            raise HTTPException(403, "No tiene permiso sobre esta zona")
+        cur.execute(
+            "SELECT cliente_id, numero_cliente, nombre_completo, referencia_domicilio, "
+            "latitud, longitud, zona_id FROM clientes WHERE zona_id = %s ORDER BY cliente_id",
+            (zona_id,),
+        )
+    elif payload.get("rol") == "Administrador":
+        cur.execute(
+            "SELECT cliente_id, numero_cliente, nombre_completo, referencia_domicilio, "
+            "latitud, longitud, zona_id FROM clientes ORDER BY cliente_id"
+        )
+    else:
+        cur.execute(
+            "SELECT c.cliente_id, c.numero_cliente, c.nombre_completo, "
+            "c.referencia_domicilio, c.latitud, c.longitud, c.zona_id "
+            "FROM clientes c JOIN zonas z ON c.zona_id = z.zona_id "
+            "WHERE z.supervisor_id = %s ORDER BY c.cliente_id",
+            (payload.get("supervisor_id"),),
+        )
     filas = cur.fetchall(); cur.close(); conn.close()
     return [{"cliente_id": f[0], "numero_cliente": f[1], "nombre_completo": f[2],
-             "latitud": f[3], "longitud": f[4], "zona_id": f[5]} for f in filas]
+             "referencia_domicilio": f[3], "latitud": f[4], "longitud": f[5],
+             "zona_id": f[6]} for f in filas]
 
 
 @app.post("/clientes", status_code=201)
-def crear_cliente(c: ClienteIn):
+def crear_cliente(c: ClienteIn, payload: dict = Depends(requerir_login)):
     conn = get_conn(); cur = conn.cursor()
+    if not zona_permitida(conn, c.zona_id, payload):
+        cur.close(); conn.close()
+        raise HTTPException(403, "No tiene permiso para registrar clientes en esta zona")
     cur.execute(
         "INSERT INTO clientes (numero_cliente, nombre_completo, referencia_domicilio, "
         "latitud, longitud, zona_id) VALUES (%s,%s,%s,%s,%s,%s) RETURNING cliente_id",
@@ -383,6 +427,47 @@ def crear_cliente(c: ClienteIn):
     nuevo_id = cur.fetchone()[0]
     conn.commit(); cur.close(); conn.close()
     return {"cliente_id": nuevo_id}
+
+
+@app.put("/clientes/{cliente_id}")
+def actualizar_cliente(cliente_id: int, c: ClienteUpdate,
+                       payload: dict = Depends(requerir_login)):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT zona_id FROM clientes WHERE cliente_id = %s", (cliente_id,))
+    fila = cur.fetchone()
+    if not fila:
+        cur.close(); conn.close()
+        raise HTTPException(404, "Cliente no encontrado")
+    if not zona_permitida(conn, fila[0], payload):
+        cur.close(); conn.close()
+        raise HTTPException(403, "No tiene permiso sobre este cliente")
+    sets, vals = [], []
+    for campo in ("numero_cliente", "nombre_completo", "referencia_domicilio",
+                  "latitud", "longitud"):
+        valor = getattr(c, campo)
+        if valor is not None:
+            sets.append(f"{campo} = %s"); vals.append(valor)
+    if sets:
+        vals.append(cliente_id)
+        cur.execute(f"UPDATE clientes SET {', '.join(sets)} WHERE cliente_id = %s", vals)
+    conn.commit(); cur.close(); conn.close()
+    return {"mensaje": "Cliente actualizado correctamente"}
+
+
+@app.delete("/clientes/{cliente_id}")
+def eliminar_cliente(cliente_id: int, payload: dict = Depends(requerir_login)):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT zona_id FROM clientes WHERE cliente_id = %s", (cliente_id,))
+    fila = cur.fetchone()
+    if not fila:
+        cur.close(); conn.close()
+        raise HTTPException(404, "Cliente no encontrado")
+    if not zona_permitida(conn, fila[0], payload):
+        cur.close(); conn.close()
+        raise HTTPException(403, "No tiene permiso sobre este cliente")
+    cur.execute("DELETE FROM clientes WHERE cliente_id = %s RETURNING cliente_id", (cliente_id,))
+    conn.commit(); cur.close(); conn.close()
+    return {"mensaje": "Cliente eliminado correctamente"}
 
 
 # ---------------- CRUD de usuarios (solo Administrador) ----------------
@@ -481,118 +566,3 @@ def eliminar_usuario(numero_empleado: str, _: dict = Depends(requerir_admin)):
     cur.execute("DELETE FROM usuarios WHERE numero_empleado = %s", (numero_empleado,))
     conn.commit(); cur.close(); conn.close()
     return {"mensaje": "Usuario eliminado correctamente"}
-
-# ---------------- Clientes con permiso por zona ----------------
-class ClienteUpdate(BaseModel):
-    numero_cliente: Optional[str] = None
-    nombre_completo: Optional[str] = None
-    referencia_domicilio: Optional[str] = None
-    latitud: Optional[float] = None
-    longitud: Optional[float] = None
-
-
-def requerir_login(payload: dict = Depends(obtener_payload)):
-    return payload
-
-
-def zona_permitida(conn, zona_id: int, payload: dict) -> bool:
-    """Verdadero si el usuario del token puede operar la zona (Admin: todas)."""
-    if payload.get("rol") == "Administrador":
-        return True
-    sup_id = payload.get("supervisor_id")
-    if sup_id is None:
-        return False
-    cur = conn.cursor()
-    cur.execute("SELECT supervisor_id FROM zonas WHERE zona_id = %s", (zona_id,))
-    fila = cur.fetchone()
-    cur.close()
-    return fila is not None and fila[0] == sup_id
-
-
-@app.get("/clientes")
-def listar_clientes(zona_id: int = None, payload: dict = Depends(requerir_login)):
-    conn = get_conn(); cur = conn.cursor()
-    if zona_id is not None:
-        if not zona_permitida(conn, zona_id, payload):
-            cur.close(); conn.close()
-            raise HTTPException(403, "No tiene permiso sobre esta zona")
-        cur.execute(
-            "SELECT cliente_id, numero_cliente, nombre_completo, referencia_domicilio, "
-            "latitud, longitud, zona_id FROM clientes WHERE zona_id = %s ORDER BY cliente_id",
-            (zona_id,),
-        )
-    elif payload.get("rol") == "Administrador":
-        cur.execute(
-            "SELECT cliente_id, numero_cliente, nombre_completo, referencia_domicilio, "
-            "latitud, longitud, zona_id FROM clientes ORDER BY cliente_id"
-        )
-    else:
-        cur.execute(
-            "SELECT c.cliente_id, c.numero_cliente, c.nombre_completo, "
-            "c.referencia_domicilio, c.latitud, c.longitud, c.zona_id "
-            "FROM clientes c JOIN zonas z ON c.zona_id = z.zona_id "
-            "WHERE z.supervisor_id = %s ORDER BY c.cliente_id",
-            (payload.get("supervisor_id"),),
-        )
-    filas = cur.fetchall(); cur.close(); conn.close()
-    return [{"cliente_id": f[0], "numero_cliente": f[1], "nombre_completo": f[2],
-             "referencia_domicilio": f[3], "latitud": f[4], "longitud": f[5],
-             "zona_id": f[6]} for f in filas]
-
-
-@app.post("/clientes", status_code=201)
-def crear_cliente(c: ClienteIn, payload: dict = Depends(requerir_login)):
-    conn = get_conn(); cur = conn.cursor()
-    if not zona_permitida(conn, c.zona_id, payload):
-        cur.close(); conn.close()
-        raise HTTPException(403, "No tiene permiso para registrar clientes en esta zona")
-    cur.execute(
-        "INSERT INTO clientes (numero_cliente, nombre_completo, referencia_domicilio, "
-        "latitud, longitud, zona_id) VALUES (%s,%s,%s,%s,%s,%s) RETURNING cliente_id",
-        (c.numero_cliente, c.nombre_completo, c.referencia_domicilio,
-         c.latitud, c.longitud, c.zona_id),
-    )
-    nuevo_id = cur.fetchone()[0]
-    conn.commit(); cur.close(); conn.close()
-    return {"cliente_id": nuevo_id}
-
-
-@app.put("/clientes/{cliente_id}")
-def actualizar_cliente(cliente_id: int, c: ClienteUpdate,
-                       payload: dict = Depends(requerir_login)):
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT zona_id FROM clientes WHERE cliente_id = %s", (cliente_id,))
-    fila = cur.fetchone()
-    if not fila:
-        cur.close(); conn.close()
-        raise HTTPException(404, "Cliente no encontrado")
-    if not zona_permitida(conn, fila[0], payload):
-        cur.close(); conn.close()
-        raise HTTPException(403, "No tiene permiso sobre este cliente")
-    sets, vals = [], []
-    for campo in ("numero_cliente", "nombre_completo", "referencia_domicilio",
-                  "latitud", "longitud"):
-        valor = getattr(c, campo)
-        if valor is not None:
-            sets.append(f"{campo} = %s"); vals.append(valor)
-    if sets:
-        vals.append(cliente_id)
-        cur.execute(f"UPDATE clientes SET {', '.join(sets)} WHERE cliente_id = %s", vals)
-    conn.commit(); cur.close(); conn.close()
-    return {"mensaje": "Cliente actualizado correctamente"}
-
-
-@app.delete("/clientes/{cliente_id}")
-def eliminar_cliente(cliente_id: int, payload: dict = Depends(requerir_login)):
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT zona_id FROM clientes WHERE cliente_id = %s", (cliente_id,))
-    fila = cur.fetchone()
-    if not fila:
-        cur.close(); conn.close()
-        raise HTTPException(404, "Cliente no encontrado")
-    if not zona_permitida(conn, fila[0], payload):
-        cur.close(); conn.close()
-        raise HTTPException(403, "No tiene permiso sobre este cliente")
-    cur.execute("DELETE FROM clientes WHERE cliente_id = %s RETURNING cliente_id", (cliente_id,))
-    conn.commit(); cur.close(); conn.close()
-    return {"mensaje": "Cliente eliminado correctamente"}
