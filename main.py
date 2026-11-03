@@ -66,6 +66,7 @@ def requerir_login(payload: dict = Depends(obtener_payload)):
 
 
 def zona_permitida(conn, zona_id: int, payload: dict) -> bool:
+    """Verdadero si el usuario del token puede operar la zona (Admin: todas)."""
     if payload.get("rol") == "Administrador":
         return True
     sup_id = payload.get("supervisor_id")
@@ -338,6 +339,14 @@ def listar_zonas(supervisor_id: int = None):
 @app.post("/zonas", status_code=201)
 def crear_zona(z: ZonaIn, _: dict = Depends(requerir_admin)):
     conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT 1 FROM zonas WHERE UPPER(nombre_zona) = UPPER(%s)", (z.nombre_zona,))
+    if cur.fetchone():
+        cur.close(); conn.close()
+        raise HTTPException(409, "La zona ya está asignada a un supervisor")
+    cur.execute("SELECT 1 FROM catalogo_zonas WHERE UPPER(nombre_zona) = UPPER(%s)", (z.nombre_zona,))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        raise HTTPException(422, "El nombre no pertenece al catálogo oficial de zonas")
     cur.execute(
         "INSERT INTO zonas (nombre_zona, supervisor_id) VALUES (%s, %s) RETURNING zona_id",
         (z.nombre_zona, z.supervisor_id),
@@ -351,6 +360,13 @@ def crear_zona(z: ZonaIn, _: dict = Depends(requerir_admin)):
 @app.put("/zonas/{zona_id}")
 def actualizar_zona(zona_id: int, z: ZonaUpdate, _: dict = Depends(requerir_admin)):
     conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM zonas WHERE UPPER(nombre_zona) = UPPER(%s) AND zona_id <> %s",
+        (z.nombre_zona, zona_id),
+    )
+    if cur.fetchone():
+        cur.close(); conn.close()
+        raise HTTPException(409, "La zona ya está asignada a un supervisor")
     cur.execute(
         "UPDATE zonas SET nombre_zona = %s WHERE zona_id = %s "
         "RETURNING zona_id, supervisor_id",
@@ -378,6 +394,22 @@ def eliminar_zona(zona_id: int, _: dict = Depends(requerir_admin)):
         raise HTTPException(404, "Zona no encontrada")
     conn.commit(); cur.close(); conn.close()
     return {"mensaje": "Zona eliminada correctamente"}
+
+
+# ---------------- Catálogo oficial de zonas ----------------
+@app.get("/zonas/catalogo")
+def catalogo_zonas(disponibles: bool = False, _: dict = Depends(requerir_admin)):
+    conn = get_conn(); cur = conn.cursor()
+    if disponibles:
+        cur.execute(
+            "SELECT catalogo_id, nombre_zona FROM catalogo_zonas "
+            "WHERE UPPER(nombre_zona) NOT IN (SELECT UPPER(nombre_zona) FROM zonas) "
+            "ORDER BY nombre_zona"
+        )
+    else:
+        cur.execute("SELECT catalogo_id, nombre_zona FROM catalogo_zonas ORDER BY nombre_zona")
+    filas = cur.fetchall(); cur.close(); conn.close()
+    return [{"catalogo_id": f[0], "nombre_zona": f[1]} for f in filas]
 
 
 # ---------------- Clientes con permiso por zona ----------------
