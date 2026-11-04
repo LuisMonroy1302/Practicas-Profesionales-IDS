@@ -598,3 +598,44 @@ def eliminar_usuario(numero_empleado: str, _: dict = Depends(requerir_admin)):
     cur.execute("DELETE FROM usuarios WHERE numero_empleado = %s", (numero_empleado,))
     conn.commit(); cur.close(); conn.close()
     return {"mensaje": "Usuario eliminado correctamente"}
+
+# ---------------- Reportes ejecutivos (solo Administrador) ----------------
+@app.get("/reportes/resumen")
+def resumen_ejecutivo(_: dict = Depends(requerir_admin)):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM grupos")
+    total_grupos = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM supervisores")
+    total_supervisores = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM zonas")
+    total_zonas = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM clientes")
+    total_clientes = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM clientes WHERE latitud = 0 AND longitud = 0")
+    clientes_sin_geo = cur.fetchone()[0]
+    cur.execute(
+        "SELECT z.nombre_zona, COUNT(c.cliente_id) "
+        "FROM zonas z LEFT JOIN clientes c ON c.zona_id = z.zona_id "
+        "GROUP BY z.zona_id, z.nombre_zona "
+        "ORDER BY COUNT(c.cliente_id) DESC"
+    )
+    clientes_por_zona = [{"zona": f[0], "total": f[1]} for f in cur.fetchall()]
+    cur.execute(
+        "SELECT s.nombre_completo, COUNT(z.zona_id) "
+        "FROM supervisores s LEFT JOIN zonas z ON z.supervisor_id = s.supervisor_id "
+        "GROUP BY s.supervisor_id, s.nombre_completo "
+        "ORDER BY COUNT(z.zona_id) DESC"
+    )
+    zonas_por_supervisor = [{"supervisor": f[0], "total": f[1]} for f in cur.fetchall()]
+    cur.close(); conn.close()
+    return {
+        "centro_trabajo": "536401",
+        "total_grupos": total_grupos,
+        "total_supervisores": total_supervisores,
+        "total_zonas": total_zonas,
+        "total_clientes": total_clientes,
+        "clientes_sin_geolocalizar": clientes_sin_geo,
+        "clientes_geolocalizados": total_clientes - clientes_sin_geo,
+        "clientes_por_zona": clientes_por_zona,
+        "zonas_por_supervisor": zonas_por_supervisor,
+    }
