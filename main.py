@@ -450,14 +450,19 @@ def crear_cliente(c: ClienteIn, payload: dict = Depends(requerir_login)):
     if not zona_permitida(conn, c.zona_id, payload):
         cur.close(); conn.close()
         raise HTTPException(403, "No tiene permiso para registrar clientes en esta zona")
-    cur.execute(
-        "INSERT INTO clientes (numero_cliente, nombre_completo, referencia_domicilio, "
-        "latitud, longitud, zona_id) VALUES (%s,%s,%s,%s,%s,%s) RETURNING cliente_id",
-        (c.numero_cliente, c.nombre_completo, c.referencia_domicilio,
-         c.latitud, c.longitud, c.zona_id),
-    )
-    nuevo_id = cur.fetchone()[0]
-    conn.commit(); cur.close(); conn.close()
+    try:
+        cur.execute(
+            "INSERT INTO clientes (numero_cliente, nombre_completo, referencia_domicilio, "
+            "latitud, longitud, zona_id) VALUES (%s,%s,%s,%s,%s,%s) RETURNING cliente_id",
+            (c.numero_cliente, c.nombre_completo, c.referencia_domicilio,
+             c.latitud, c.longitud, c.zona_id),
+        )
+        nuevo_id = cur.fetchone()[0]
+        conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback(); cur.close(); conn.close()
+        raise HTTPException(409, "Ya existe número de cliente")
+    cur.close(); conn.close()
     return {"cliente_id": nuevo_id}
 
 
@@ -598,6 +603,7 @@ def eliminar_usuario(numero_empleado: str, _: dict = Depends(requerir_admin)):
     cur.execute("DELETE FROM usuarios WHERE numero_empleado = %s", (numero_empleado,))
     conn.commit(); cur.close(); conn.close()
     return {"mensaje": "Usuario eliminado correctamente"}
+
 
 # ---------------- Reportes ejecutivos (solo Administrador) ----------------
 @app.get("/reportes/resumen")
