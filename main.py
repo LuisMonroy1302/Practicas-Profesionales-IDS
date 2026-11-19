@@ -130,6 +130,7 @@ class ClienteUpdate(BaseModel):
     referencia_domicilio: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
+    zona_id: Optional[int] = None
 
 
 class UsuarioIn(BaseModel):
@@ -475,20 +476,34 @@ def actualizar_cliente(cliente_id: int, c: ClienteUpdate,
     if not fila:
         cur.close(); conn.close()
         raise HTTPException(404, "Cliente no encontrado")
-    if not zona_permitida(conn, fila[0], payload):
+    zona_actual = fila[0]
+    # ORIGEN: el Supervisor solo opera clientes de sus zonas; el Admin, cualquiera.
+    if not zona_permitida(conn, zona_actual, payload):
         cur.close(); conn.close()
         raise HTTPException(403, "No tiene permiso sobre este cliente")
+    zona_destino = zona_actual
+    if c.zona_id is not None and c.zona_id != zona_actual:
+        # DESTINO: debe existir en 'zonas' (toda zona ahí ya está asignada a un
+        # supervisor). Se permite el traspaso de cartera entre supervisores.
+        cur.execute("SELECT supervisor_id FROM zonas WHERE zona_id = %s", (c.zona_id,))
+        if not cur.fetchone():
+            cur.close(); conn.close()
+            raise HTTPException(404, "Zona de destino no encontrada o no asignada")
+        zona_destino = c.zona_id
     sets, vals = [], []
     for campo in ("numero_cliente", "nombre_completo", "referencia_domicilio",
                   "latitud", "longitud"):
         valor = getattr(c, campo)
         if valor is not None:
             sets.append(f"{campo} = %s"); vals.append(valor)
+    if zona_destino != zona_actual:
+        sets.append("zona_id = %s"); vals.append(zona_destino)
     if sets:
         vals.append(cliente_id)
         cur.execute(f"UPDATE clientes SET {', '.join(sets)} WHERE cliente_id = %s", vals)
     conn.commit(); cur.close(); conn.close()
-    return {"mensaje": "Cliente actualizado correctamente"}
+    return {"mensaje": "Cliente actualizado correctamente",
+            "zona_id": zona_destino}
 
 
 @app.delete("/clientes/{cliente_id}")
