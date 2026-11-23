@@ -31,6 +31,9 @@ if not DATABASE_URL:
 SECRET_KEY = "geocustomers-piloto-2026"
 ALGORITHM = "HS256"
 
+# Roles con capacidad de gestión total sobre la operación del centro.
+ROLES_GESTION = ("Administrador", "Líder")
+
 
 def get_conn():
     if "neon.tech" in DATABASE_URL:
@@ -56,8 +59,8 @@ def obtener_payload(authorization: str = Header(None)):
 
 
 def requerir_admin(payload: dict = Depends(obtener_payload)):
-    if payload.get("rol") != "Administrador":
-        raise HTTPException(403, "Privilegios de Administrador requeridos")
+    if payload.get("rol") not in ROLES_GESTION:
+        raise HTTPException(403, "Privilegios de Administrador o Líder requeridos")
     return payload
 
 
@@ -66,8 +69,8 @@ def requerir_login(payload: dict = Depends(obtener_payload)):
 
 
 def zona_permitida(conn, zona_id: int, payload: dict) -> bool:
-    """Verdadero si el usuario del token puede operar la zona (Admin: todas)."""
-    if payload.get("rol") == "Administrador":
+    """Verdadero si el usuario del token puede operar la zona (gestión: todas)."""
+    if payload.get("rol") in ROLES_GESTION:
         return True
     sup_id = payload.get("supervisor_id")
     if sup_id is None:
@@ -190,7 +193,7 @@ def login(datos: LoginIn):
             "supervisor_id": supervisor_id, "grupo_id": grupo_id}
 
 
-# ---------------- Grupos (lectura libre, escritura solo Administrador) ----------------
+# ---------------- Grupos (lectura libre, escritura solo gestión) ----------------
 @app.get("/grupos")
 def listar_grupos():
     conn = get_conn(); cur = conn.cursor()
@@ -244,7 +247,7 @@ def eliminar_grupo(grupo_id: int, _: dict = Depends(requerir_admin)):
     return {"mensaje": "Grupo eliminado correctamente"}
 
 
-# ---------------- Supervisores (lectura libre, escritura solo Administrador) ----------------
+# ---------------- Supervisores (lectura libre, escritura solo gestión) ----------------
 @app.get("/supervisores")
 def listar_supervisores(grupo_id: int = None):
     conn = get_conn(); cur = conn.cursor()
@@ -322,7 +325,7 @@ def eliminar_supervisor(supervisor_id: int, _: dict = Depends(requerir_admin)):
     return {"mensaje": "Supervisor eliminado correctamente"}
 
 
-# ---------------- Zonas (lectura libre, escritura solo Administrador) ----------------
+# ---------------- Zonas (lectura libre, escritura solo gestión) ----------------
 @app.get("/zonas")
 def listar_zonas(supervisor_id: int = None):
     conn = get_conn(); cur = conn.cursor()
@@ -426,7 +429,7 @@ def listar_clientes(zona_id: int = None, payload: dict = Depends(requerir_login)
             "latitud, longitud, zona_id FROM clientes WHERE zona_id = %s ORDER BY cliente_id",
             (zona_id,),
         )
-    elif payload.get("rol") == "Administrador":
+    elif payload.get("rol") in ROLES_GESTION:
         cur.execute(
             "SELECT cliente_id, numero_cliente, nombre_completo, referencia_domicilio, "
             "latitud, longitud, zona_id FROM clientes ORDER BY cliente_id"
@@ -477,7 +480,7 @@ def actualizar_cliente(cliente_id: int, c: ClienteUpdate,
         cur.close(); conn.close()
         raise HTTPException(404, "Cliente no encontrado")
     zona_actual = fila[0]
-    # ORIGEN: el Supervisor solo opera clientes de sus zonas; el Admin, cualquiera.
+    # ORIGEN: el Supervisor solo opera clientes de sus zonas; gestión, cualquiera.
     if not zona_permitida(conn, zona_actual, payload):
         cur.close(); conn.close()
         raise HTTPException(403, "No tiene permiso sobre este cliente")
@@ -522,7 +525,7 @@ def eliminar_cliente(cliente_id: int, payload: dict = Depends(requerir_login)):
     return {"mensaje": "Cliente eliminado correctamente"}
 
 
-# ---------------- CRUD de usuarios (solo Administrador) ----------------
+# ---------------- CRUD de usuarios (solo gestión, con jerarquía de roles) ----------------
 @app.get("/usuarios")
 def listar_usuarios(_: dict = Depends(requerir_admin)):
     conn = get_conn(); cur = conn.cursor()
@@ -532,13 +535,15 @@ def listar_usuarios(_: dict = Depends(requerir_admin)):
 
 
 @app.post("/usuarios", status_code=201)
-def crear_usuario(u: UsuarioIn, _: dict = Depends(requerir_admin)):
-    if u.rol not in ("Administrador", "Supervisor"):
+def crear_usuario(u: UsuarioIn, payload: dict = Depends(requerir_admin)):
+    if u.rol not in ("Administrador", "Líder", "Supervisor"):
         raise HTTPException(422, "Rol no válido")
-    if u.rol == "Supervisor" and u.grupo_id is None:
-        raise HTTPException(422, "Un usuario Supervisor requiere grupo_id")
     if u.rol == "Administrador":
         raise HTTPException(409, "Solo puede existir un usuario Administrador")
+    if u.rol == "Líder" and payload.get("rol") != "Administrador":
+        raise HTTPException(403, "Solo el Administrador puede crear usuarios Líder")
+    if u.rol == "Supervisor" and u.grupo_id is None:
+        raise HTTPException(422, "Un usuario Supervisor requiere grupo_id")
     conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute(
@@ -573,9 +578,23 @@ def actualizar_usuario(numero_empleado: str, u: UsuarioUpdate,
         cur.close(); conn.close()
         raise HTTPException(404, "Usuario no encontrado")
     rol_actual = fila[0]
+    rol_solicitante = payload.get("rol")
+    # Blindajes jerárquicos
+    if rol_actual == "Administrador" and rol_solicitante != "Administrador":
+        cur.close(); conn.close()
+        raise HTTPException(403, "Solo el Administrador puede modificar al Administrador")
     if rol_actual == "Administrador" and u.rol and u.rol != "Administrador":
         cur.close(); conn.close()
         raise HTTPException(409, "No se puede degradar al único Administrador")
+    if rol_actual == "Líder" and rol_solicitante == "Líder":
+        cur.close(); conn.close()
+        raise HTTPException(403, "Un Líder no puede modificar a otro Líder")
+    if u.rol == "Líder" and rol_solicitante != "Administrador":
+        cur.close(); conn.close()
+        raise HTTPException(403, "Solo el Administrador puede asignar el rol Líder")
+    if u.rol == "Administrador":
+        cur.close(); conn.close()
+        raise HTTPException(409, "No se puede asignar el rol Administrador")
     sets, vals = [], []
     if u.nombre:
         sets.append("nombre = %s"); vals.append(u.nombre)
@@ -594,7 +613,7 @@ def actualizar_usuario(numero_empleado: str, u: UsuarioUpdate,
 
 
 @app.delete("/usuarios/{numero_empleado}")
-def eliminar_usuario(numero_empleado: str, _: dict = Depends(requerir_admin)):
+def eliminar_usuario(numero_empleado: str, payload: dict = Depends(requerir_admin)):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT rol FROM usuarios WHERE numero_empleado = %s", (numero_empleado,))
     fila = cur.fetchone()
@@ -604,6 +623,9 @@ def eliminar_usuario(numero_empleado: str, _: dict = Depends(requerir_admin)):
     if fila[0] == "Administrador":
         cur.close(); conn.close()
         raise HTTPException(409, "No se puede eliminar al único Administrador")
+    if fila[0] == "Líder" and payload.get("rol") == "Líder":
+        cur.close(); conn.close()
+        raise HTTPException(403, "Un Líder no puede eliminar a otro Líder")
     if numero_empleado.isdigit():
         cur.execute(
             "SELECT COUNT(*) FROM zonas z JOIN supervisores s "
@@ -620,7 +642,7 @@ def eliminar_usuario(numero_empleado: str, _: dict = Depends(requerir_admin)):
     return {"mensaje": "Usuario eliminado correctamente"}
 
 
-# ---------------- Reportes ejecutivos (solo Administrador) ----------------
+# ---------------- Reportes ejecutivos (solo gestión) ----------------
 @app.get("/reportes/resumen")
 def resumen_ejecutivo(_: dict = Depends(requerir_admin)):
     conn = get_conn(); cur = conn.cursor()
