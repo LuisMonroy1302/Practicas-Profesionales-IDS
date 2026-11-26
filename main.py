@@ -457,17 +457,23 @@ def crear_cliente(c: ClienteIn, payload: dict = Depends(requerir_login)):
     try:
         cur.execute(
             "INSERT INTO clientes (numero_cliente, nombre_completo, referencia_domicilio, "
-            "latitud, longitud, zona_id) VALUES (%s,%s,%s,%s,%s,%s) RETURNING cliente_id",
+            "latitud, longitud, zona_id) VALUES (%s,%s,%s,%s,%s,%s) "
+            "RETURNING cliente_id, numero_cliente, nombre_completo, referencia_domicilio, "
+            "latitud, longitud, zona_id",
             (c.numero_cliente, c.nombre_completo, c.referencia_domicilio,
              c.latitud, c.longitud, c.zona_id),
         )
-        nuevo_id = cur.fetchone()[0]
+        f = cur.fetchone()
         conn.commit()
     except psycopg2.errors.UniqueViolation:
         conn.rollback(); cur.close(); conn.close()
         raise HTTPException(409, "Ya existe número de cliente")
     cur.close(); conn.close()
-    return {"cliente_id": nuevo_id}
+    # El 201 devuelve la fila completa para que el cliente Android pueda
+    # deserializar el objeto Cliente sin campos faltantes tras el commit.
+    return {"cliente_id": f[0], "numero_cliente": f[1], "nombre_completo": f[2],
+            "referencia_domicilio": f[3], "latitud": f[4], "longitud": f[5],
+            "zona_id": f[6]}
 
 
 @app.put("/clientes/{cliente_id}")
@@ -570,7 +576,7 @@ def crear_usuario(u: UsuarioIn, payload: dict = Depends(requerir_admin)):
 
 @app.put("/usuarios/{numero_empleado}")
 def actualizar_usuario(numero_empleado: str, u: UsuarioUpdate,
-                       _: dict = Depends(requerir_admin)):
+                       payload: dict = Depends(requerir_admin)):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT rol FROM usuarios WHERE numero_empleado = %s", (numero_empleado,))
     fila = cur.fetchone()
